@@ -30,6 +30,7 @@ int relayPin[9]                 = {  31,   32,   33,   34,   35,   36,   37,   3
 int weichenStellungGerade[9]    = {  55,   55,   50,   50,   50,   55,   55,   45,   50};
 int weichenStellungAbgebogen[9] = { 125,  125,  120,  140,  130,  125,  125,  111,  125};
 int relayDir[9]                 ={false, true, true, true, true, true,false,false,false};
+
 // state
 bool weichenState[9] =            {true, true, true, true, true, true, true, true, true};
 Servo servo[9];
@@ -38,8 +39,25 @@ Servo servo[9];
 int actWinkelList[]  = {0, 0, 0, 0, 0, 0, 0, 0, 0};
 int zielWinkelList[] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
 
+// Lokschuppen Variablen & Config
+Servo servoDoorLeft;
+Servo servoDoorRight;
+const int doorLeftPin = 44;
+const int doorRightPin = 46;
+const int doorLeftClosed = 30;
+const int doorRightClosed = 120;
+const int doorLeftOpen = 145;
+const int doorRightOpen = 5;
+const int doorNid = 1201;
+bool doorClosed = true;
+int actWinkelDoorLeft = doorLeftClosed;
+int actWinkelDoorRight = doorRightClosed;
+int zielWinkelDoorLeft = doorLeftClosed;
+int zielWinkelDoorRight = doorRightClosed;
+
 
 unsigned long lastWinkelStep = 0;
+unsigned long lastWinkelStepDoor = 0;
 
 int getRelayDirection(int weichenNr) {
   return relayDir[weichenNr - WEICHEN_NR_FROM];
@@ -101,10 +119,24 @@ void sendCan(int weichenNr, ZCAN_MODE mode) {
   zcanMessage.mode = mode;
   zcanMessage.networkId = NETWORK_ID;
   zcanMessage.dataLength = 4;
-  zcanMessage.data[0] = (getZubehoerNid(weichenNr)) & 0xff;;
+  zcanMessage.data[0] = (getZubehoerNid(weichenNr)) & 0xff;
   zcanMessage.data[1] = ((getZubehoerNid(weichenNr)) >> 8);
   zcanMessage.data[2] = PORT;
   zcanMessage.data[3] = getWeichenState(weichenNr) ? 0b1 : 0b0;
+  mcp2515.sendMessage(&toCanFrame(zcanMessage));
+}
+
+void sendCanDoor(ZCAN_MODE mode) {
+  struct zcan_message zcanMessage;
+  zcanMessage.group = ZCAN_GROUP::ZUBEHOER;
+  zcanMessage.command = 4;  // Command.PORT4
+  zcanMessage.mode = mode;
+  zcanMessage.networkId = NETWORK_ID;
+  zcanMessage.dataLength = 4;
+  zcanMessage.data[0] = ((doorNid) & 0xff);
+  zcanMessage.data[1] = ((doorNid) >> 8);
+  zcanMessage.data[2] = PORT;
+  zcanMessage.data[3] = doorClosed ? 0b1 : 0b0;
   mcp2515.sendMessage(&toCanFrame(zcanMessage));
 }
 
@@ -121,6 +153,19 @@ void initWeiche(int weichenNr) {
   servo[weichenIndex].detach();
 }
 
+void initDoors() {
+  actWinkelDoorLeft = zielWinkelDoorLeft;
+  actWinkelDoorRight = zielWinkelDoorRight;
+  servoDoorLeft.attach(doorLeftPin);
+  servoDoorLeft.write(zielWinkelDoorLeft);
+  delay(1000);
+  servoDoorLeft.detach();
+  servoDoorRight.attach(doorRightPin);
+  servoDoorRight.write(zielWinkelDoorRight);
+  delay(1000);
+  servoDoorRight.detach();
+}
+
 void computeCommand(int weichenNr, bool stellungGerade) {
   bool oldState = getWeichenState(weichenNr);
   if (oldState == stellungGerade) {
@@ -133,8 +178,18 @@ void computeCommand(int weichenNr, bool stellungGerade) {
   setServoTo(weichenNr, stellungGerade);
 }
 
+void computeDoorCommand(bool doorClosedNew) {
+  if (doorClosed == doorClosedNew) {
+    sendCanDoor(ZCAN_MODE::EVENT);
+    return;
+  }
+  doorClosed = doorClosedNew;
+  sendCanDoor(ZCAN_MODE::EVENT);
+  zielWinkelDoorLeft = doorClosed ? doorLeftClosed : doorLeftOpen;
+  zielWinkelDoorRight = doorClosed ? doorRightClosed : doorRightOpen;
+}
+
 void setup() {
-  // Serial.begin(9600); 
   
   for (int i = WEICHEN_NR_FROM; i <= WEICHEN_NR_TO; i++) {
     pinMode(getRelayPin(i), OUTPUT);
@@ -154,10 +209,12 @@ void setup() {
   for (int i = WEICHEN_NR_FROM; i <= WEICHEN_NR_TO; i++) {
     initWeiche(i);
   }
+
+  // init lokschuppen doors
+  initDoors();
 }
 
-void loop() {
- 
+void loop() { 
   // poll CAN message
   if (mcp2515.readMessage(&canMsg) == MCP2515::ERROR_OK) {
     zcan_message zcanMsg = toZCanMessage(canMsg);   
@@ -184,6 +241,16 @@ void loop() {
           bool stellungGerade = (zcanMsg.data[3] & 0b1) > 0;
           computeCommand(weichenNr, stellungGerade);
         }
+      } else if (nid == doorNid) {
+        // answere request with current state
+        if (zcanMsg.mode == ZCAN_MODE::REQUEST) {
+          sendCanDoor(ZCAN_MODE::EVENT);
+        }
+        // compute command
+        if (zcanMsg.mode == ZCAN_MODE::COMMAND) {
+          bool doorClosedNew = (zcanMsg.data[3] & 0b1) > 0;
+          computeDoorCommand(doorClosedNew);
+        }
       }
     }
   }
@@ -205,8 +272,35 @@ void loop() {
         if (zielWinkel == actWinkel + inc) {
           servo[weicheIndex].detach();
         }
-        break;
+        return;
       }
     }
+  }
+
+  // stelle Door
+  if (millis() - lastWinkelStepDoor >= 16) {
+    lastWinkelStepDoor = millis();
+    if (actWinkelDoorLeft != zielWinkelDoorLeft) {
+      int inc = ((zielWinkelDoorLeft - actWinkelDoorLeft) > 0) ? 1 : -1;
+      actWinkelDoorLeft = actWinkelDoorLeft + inc;
+      if (!servoDoorLeft.attached()) {
+        servoDoorLeft.attach(doorLeftPin);
+      }
+      servoDoorLeft.write(actWinkelDoorLeft);
+      if (zielWinkelDoorLeft == actWinkelDoorLeft) {
+        servoDoorLeft.detach();
+      }
+    }
+    if (actWinkelDoorRight != zielWinkelDoorRight) {
+      int inc = ((zielWinkelDoorRight - actWinkelDoorRight) > 0) ? 1 : -1;
+      actWinkelDoorRight = actWinkelDoorRight + inc;
+      if (!servoDoorRight.attached()) {
+        servoDoorRight.attach(doorRightPin);
+      }
+      servoDoorRight.write(actWinkelDoorRight);
+      if (zielWinkelDoorRight == actWinkelDoorRight) {
+        servoDoorRight.detach();
+      }
+    }    
   }
 }
