@@ -2,6 +2,7 @@ Arduino-Nano-PINS.jpg
 ArduinoNanoCANPins.png
 Vitrine.zip
 VitrineBackup.ino
+Shiftregister_tpic6b595.pdf
 libs/Grove_4Digital_Display-master.zip
 libs/Grove_4Digital_Display-master/
 libs/Seeed_Arduino_AS5600-master.zip
@@ -10,3 +11,5 @@ libs/TimerOne-r11.zip
 libs/arduino-mcp2515-master.zip
 libs/arduino-mcp2515-master/
 libs/readme.txt
+libs/Arduino-TPIC6B595-master.zip
+libs/Arduino-TPIC6B595-master/
