@@ -29,13 +29,13 @@ MCP2515 mcp2515(10); // SPI CS Pin
 struct can_frame canMsg;
 
 // config
-#define SIGNAL_COUNT (7)
+#define SIGNAL_COUNT (8)
 #define REGISTER_COUNT (4)
-// 1 data byte, bits: [HALT (Rot oder Weiße schräg), HALT2 (weiße schräg auf Hauptsignal), FREI (grün rechts oben oder weiße horizontal), FREI2 (rechts unten), GELB, LEER, LEER, LEER]
-int signalNIDs[SIGNAL_COUNT]       = {       1306,       1307,       1308,       1309,       1310,       1311,       1312};
-byte signalState[SIGNAL_COUNT]     = { 0b00000001, 0b00000001, 0b00000001, 0b00000001, 0b00000001, 0b00000001, 0b00000001};
-byte usedBitsMask[SIGNAL_COUNT]    = { 0b00011101, 0b00011101, 0b00011101, 0b00011101, 0b00011101, 0b00011101, 0b00011101};
-byte registerState[REGISTER_COUNT] = {0, 0, 0, 0};
+// 1 data byte, bits: [LEER, LEER, LEER, GELB, FREI2 (rechts unten), FREI (grün rechts oben oder weiße schräg), HALT2 (weiße horizontal auf Hauptsignal), HALT (Rot oder Weiße horizontal)]
+int signalNIDs[SIGNAL_COUNT]       = {       1306,       1307,       1308,       1309,       1310,       1311,       1312,       1403};
+byte signalState[SIGNAL_COUNT]     = { 0b00000001, 0b00000001, 0b00000001, 0b00000001, 0b00000001, 0b00000001, 0b00000001, 0b00000000};
+byte usedBitsMask[SIGNAL_COUNT]    = { 0b00011101, 0b00011111, 0b00000101, 0b00000101, 0b00011101, 0b00011101, 0b00011101, 0b01111111};
+byte registerState[REGISTER_COUNT] = { 0, 0, 0, 0};  // inital zero is okay, because it will be updated on startup from signalState values
 
 int getSignalIndex(int signalNID) {
   for (int i = 0; i < SIGNAL_COUNT; i++) {
@@ -52,6 +52,12 @@ byte getSignalState(int signalNID) {
 
 void setSignalState(int signalNID, byte state) {
   signalState[getSignalIndex(signalNID)] = state;
+/*Serial.print("Signal State: ");
+  for (int i = 0; i < SIGNAL_COUNT; i++) {
+    Serial.print(signalState[i], BIN);
+    Serial.print("  ");
+  }
+  Serial.println("");*/
 }
 
 void sendCan(ZCAN_MODE mode, int signalNID) {
@@ -70,31 +76,37 @@ void sendCan(ZCAN_MODE mode, int signalNID) {
 
 void updateRegisterState() {
   int registerIndex = 0;
-  int registerBitNr = 0;
+  int registerBitIndex = 7;
   registerState[registerIndex] = 0;
   for (int signalIndex = 0; signalIndex < SIGNAL_COUNT; signalIndex++) {
     // per signal byte
     byte signalStateByte = signalState[signalIndex];
-    for (int j = 0; j < usedBits[signalIndex]; j++) {
-      // per significant bit
-      byte nextBit = signalStateByte % 2;
-      signalStateByte = signalStateByte >> 1;
-      registerState[registerIndex] = registerState[registerIndex] + nextBit*128;
-      registerBitNr = registerBitNr + 1;
-      if (registerBitNr == 8) {
-        registerBitNr = 0;
-        registerIndex = registerIndex + 1;
-        registerState[registerIndex] = 0;
-      } else {
-        registerState[registerIndex] = registerState[registerIndex] >> 1;
+    for (int bitIndex = 0; bitIndex < 8; bitIndex++) {
+      // if bit is relevant for this signal
+      if (bitRead(usedBitsMask[signalIndex], bitIndex) > 0) {
+        byte bitValue = bitRead(signalState[signalIndex], bitIndex);
+        bitWrite(registerState[registerIndex], registerBitIndex, bitValue);
+        registerBitIndex--;
+        // if register byte is full, switch to next register
+        if (registerBitIndex < 0) {
+          registerBitIndex = 7;
+          registerIndex++;
+          registerState[registerIndex] = 0;
+        }
       }
     }
   }
+/*Serial.print("Register State: ");
+  for (int i = 0; i < REGISTER_COUNT; i++) {
+    Serial.print(registerState[i], BIN);
+    Serial.print("  ");
+  }
+  Serial.println("");*/
 }
 
 void updateShiftRegister() {
   updateRegisterState();
-  for (int i = 0; i < REGISTER_COUNT; i++) {
+  for (int i = REGISTER_COUNT-1; i >= 0; i--) {
     shiftRegister.write(registerState[i]);
   }
 }
@@ -112,7 +124,7 @@ void computeCommand(int signalNID, byte newState) {
 
 void setup() {
   SPI.begin();
-  // Serial.begin(115200);
+  //Serial.begin(115200);
 
   shiftRegister.begin();  
   shiftRegister.clear();

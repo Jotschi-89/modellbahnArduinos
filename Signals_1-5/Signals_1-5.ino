@@ -29,13 +29,13 @@ MCP2515 mcp2515(10); // SPI CS Pin
 struct can_frame canMsg;
 
 // config
-#define SIGNAL_COUNT (5)
-#define REGISTER_COUNT (3)
-// 1 data byte, bits: [LEER, LEER, LEER, GELB, FREI2 (rechts unten), FREI (grün rechts oben oder weiße horizontal), HALT2 (weiße schräg auf Hauptsignal), HALT (Rot oder Weiße schräg)]
-int signalNIDs[SIGNAL_COUNT]       = {       1301,       1302,       1303,       1304,       1305};
-byte signalState[SIGNAL_COUNT]     = { 0b00000001, 0b00000001, 0b00000001, 0b00000001, 0b00000001};
-byte usedBitsMask[SIGNAL_COUNT]    = { 0b00011101, 0b00011101, 0b00011101, 0b00011101, 0b00011111};
-byte registerState[REGISTER_COUNT] = { 0, 0, 0};  // inital zero is okay, because it will be updated on startup from signalState values
+#define SIGNAL_COUNT (7)
+#define REGISTER_COUNT (4)
+// 1 data byte, bits: [LEER, LEER, LEER, GELB, FREI2 (rechts unten), FREI (grün rechts oben oder weiße schräg), HALT2 (weiße horizontal auf Hauptsignal), HALT (Rot oder Weiße horizontal)]
+int signalNIDs[SIGNAL_COUNT]       = {       1301,       1302,       1303,       1304,       1305,       1401,       1402};
+byte signalState[SIGNAL_COUNT]     = { 0b00000001, 0b00000001, 0b00000001, 0b00000001, 0b00000001, 0b00000000, 0b00000000};
+byte usedBitsMask[SIGNAL_COUNT]    = { 0b00011101, 0b00011101, 0b00011101, 0b00011101, 0b00011111, 0b11111111, 0b00000111};
+byte registerState[REGISTER_COUNT] = { 0, 0, 0, 0};  // inital zero is okay, because it will be updated on startup from signalState values
 
 int getSignalIndex(int signalNID) {
   for (int i = 0; i < SIGNAL_COUNT; i++) {
