@@ -2,6 +2,7 @@
 #include <TimerOne.h>
 #include <mcp2515.h>
 #include <zcan.h>
+#include <EEPROM.h>
 
 // PIN Belegung CAN-Modul -> Arduino Mega 2560
 // Int -> 2
@@ -16,6 +17,16 @@
 #define DIR_PIN (10)  
 #define PULS_PIN (11)
 #define PULS_PIN_PMW (1) // = 11 on Mega 2560
+
+// Horizontale Schrittmotoren Pins
+#define DIR_PIN_LEFT (43)  
+#define STEP_PIN_LEFT (45)
+#define DIR_PIN_RIGHT (47)  
+#define STEP_PIN_RIGHT (49)
+
+// Endabschaltung Horizontaly Schrittmotoren Pins
+#define END_SWITCH_LEFT (24)  
+#define END_SWITCH_RIGHT (25)
 
 // Laser Pins
 #define LASER_BOTTOM_PIN (5) // lila
@@ -54,28 +65,77 @@
 
 // in steps
 #define STEPS_E0 (-12000)
-#define STEPS_E1 (-7500)  // -500 = -7500
-#define STEPS_E2 (219500) // -500 = 219500
-#define STEPS_E3 (439500) // -500 = 439500
-#define STEPS_E4 (659000) // -500 = 659000
-#define STEPS_E5 (884000) // -500 = 884000
-#define STEPS_E6 (1108500) // -500 = 1108500
-#define STEPS_E7 (1326000) // -500 = 1326000
-#define STEPS_E8 (1555000) // -500 = 1555000
-#define STEPS_E9 (1774500) // -500 = 1774500
-#define STEPS_E10 (1996500) // 0
-#define STEPS_E11 (2217000) // 0
+#define STEPS_E1 (-7500)  
+#define STEPS_E2 (219500) 
+#define STEPS_E3 (439500) 
+#define STEPS_E4 (659000) 
+#define STEPS_E5 (884000) 
+#define STEPS_E6 (1108500)
+#define STEPS_E7 (1326000)
+#define STEPS_E8 (1555000)
+#define STEPS_E9 (1774500) 
+#define STEPS_E10 (1996500) 
+#define STEPS_E11 (2217000)
+
+#define VERTICAL_CALIBRATION_STEP_FACTOR (200)
+#define HORIZONTAL_CALIBRATION_STEP_FACTOR (2)
 
 // stepper motor state
 volatile long actSteps;
 volatile long goalSteps;
-volatile int debugOffsetSteps = 0;
 boolean up;  // true -> up, false -> down
+
+// horizontal stepper motor states
+long actStepsLeft = 0;
+long actStepsRight = 0;
+long goalStepsLeft = 0;
+long goalStepsRight = 0;
+boolean stepStartedLeft = false;
+boolean stepStartedRight = false;
+boolean leftCalibrating = true;
+boolean rightCalibrating = true;
+unsigned long lastHalfStepTimestamp = 0;
+
+// EEPROM
+#define EEPROM_INIT_ADDRESS (0)
+#define EEPROM_CALIBRATION_VALUES_ADDRESS (1)
+
+// calibration commands
+enum CALIBRATION_SIDE {
+  LEFT_HORIZONTAL_IN = 0,
+  LEFT_HORIZONTAL_OUT = 1,
+  RIGHT_HORIZONTAL_IN = 2,
+  RIGHT_HORIZONTAL_OUT = 3,
+  LEFT_VERTICAL_UP = 4,
+  LEFT_VERTICAL_DOWN = 5,
+  RIGHT_VERTICAL_UP = 6,
+  RIGHT_VERTICAL_DOWN = 7,
+  LEFT_NULLPOINT_IN = 8,
+  LEFT_NULLPOINT_OUT = 9,
+  RIGHT_NULLPOINT_IN = 10,
+  RIGHT_NULLPOINT_OUT = 11,         
+  SAVE = 12
+};
+
+// calibration values
+struct calibration_values {
+  int leftHorizontal[11];
+  int rightHorizontal[11];
+  int leftVertical[11];
+  int rightVertical[11];
+};
+struct calibration_values calibrationValues {
+  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 
+  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+};
 
 // CAN Params
 #define NETWORK_ID (40200)
 #define ZUBEHOER_NID (1000)
 #define PORT (1)
+#define PORT_CALIBRATION (2)
 
 MCP2515 mcp2515(53); // SPI CS Pin
 struct can_frame canMsg;
@@ -88,9 +148,9 @@ enum VITRINE_STATE {
   STOPPED = 3,
   OPEN = 4,
   BLOCKED = 5,
-  DETECTING = 6,
-  DEBUG_OFFSET = 7
+  DETECTING = 6
 };
+// OPEN -> ADJUSTING -> OPEN; OPEN/BLOCKED -> CALIBRATING -> OPEN/BLOCKED;
 
 VITRINE_STATE state;
 uint8_t level;    // target ebene
@@ -104,6 +164,18 @@ unsigned long laserFreeTimestamp = 0;
 uint8_t detectionLevel = 0;
 unsigned long detectionTimestamp = 0;
 
+void loadEEPROMState() {
+  if (EEPROM.read(EEPROM_INIT_ADDRESS) != 255) {
+    // EEPROM not yet initialized -> save initial state
+    EEPROM.put(EEPROM_CALIBRATION_VALUES_ADDRESS, calibrationValues);
+    EEPROM.write(EEPROM_INIT_ADDRESS, 255);
+  }
+  EEPROM.get(EEPROM_CALIBRATION_VALUES_ADDRESS, calibrationValues);
+}
+
+void saveEEPROMState() {
+  EEPROM.put(EEPROM_CALIBRATION_VALUES_ADDRESS, calibrationValues);
+}
 
 boolean isBottomLaserBlocked() {
  if (digitalRead(LASER_BOTTOM_PIN) == LOW) {
@@ -137,8 +209,18 @@ uint8_t levelFromByteValue(uint8_t value) {
   return result;
 }
 
+uint8_t stepsFromByteValue(uint8_t value) {
+  uint8_t result = value >> 4 & 0b1111;
+  return result;
+}
+
 VITRINE_STATE stateFromByteValue(uint8_t value) {
   VITRINE_STATE result = static_cast<VITRINE_STATE>(value & 0b1111);
+  return result;
+}
+
+CALIBRATION_SIDE sideFromByteValue(uint8_t value) {
+  CALIBRATION_SIDE result = static_cast<CALIBRATION_SIDE>(value & 0b1111);
   return result;
 }
 
@@ -156,31 +238,42 @@ void sendCan(ZCAN_MODE mode) {
   mcp2515.sendMessage(&toCanFrame(zcanMessage));
 }
 
-long goalStepsFromLevel() {
-  if (level == 1) {
-    return STEPS_E1 + debugOffsetSteps;
-  } else if (level == 2) {
-    return STEPS_E2 + debugOffsetSteps;
-  } else if (level == 3) {
-    return STEPS_E3 + debugOffsetSteps;
-  } else if (level == 4) {
-    return STEPS_E4 + debugOffsetSteps;
-  } else if (level == 5) {
-    return STEPS_E5 + debugOffsetSteps;
-  } else if (level == 6) {
-    return STEPS_E6 + debugOffsetSteps;
-  } else if (level == 7) {
-    return STEPS_E7 + debugOffsetSteps;
-  } else if (level == 8) {
-    return STEPS_E8 + debugOffsetSteps;
-  } else if (level == 9) {
-    return STEPS_E9 + debugOffsetSteps;
-  } else if (level == 10) {
-    return STEPS_E10 + debugOffsetSteps;
-  } else if (level == 11) {
-    return STEPS_E11 + debugOffsetSteps;
+long averageVerticalCalibrationStepsForLevel(int level) {
+  if (level == 0) {
+    return 0;
   }
-  return STEPS_E0 + debugOffsetSteps;
+  return (calibrationValues.leftVertical[level-1] + calibrationValues.rightVertical[level-1]) / 2;
+}
+
+long goalStepsFromLevelUncalibrated() {
+   if (level == 1) {
+    return STEPS_E1;
+  } else if (level == 2) {
+    return STEPS_E2;
+  } else if (level == 3) {
+    return STEPS_E3;
+  } else if (level == 4) {
+    return STEPS_E4;
+  } else if (level == 5) {
+    return STEPS_E5;
+  } else if (level == 6) {
+    return STEPS_E6;
+  } else if (level == 7) {
+    return STEPS_E7;
+  } else if (level == 8) {
+    return STEPS_E8;
+  } else if (level == 9) {
+    return STEPS_E9;
+  } else if (level == 10) {
+    return STEPS_E10;
+  } else if (level == 11) {
+    return STEPS_E11;
+  }
+  return STEPS_E0;
+}
+
+long goalStepsFromLevel() {
+  return goalStepsFromLevelUncalibrated() + averageVerticalCalibrationStepsForLevel(level);
 }
 
 int relayPinFromLevel(uint8_t l) {
@@ -230,8 +323,6 @@ void printState() {
   Serial.print(level);
   Serial.print(" state: ");
   Serial.print(state);
-  Serial.print(" debugOffsetSteps: ");
-  Serial.print(debugOffsetSteps);  
   Serial.println();
 }
 
@@ -254,6 +345,15 @@ void updateSteps() {
   if (actSteps == goalSteps) {
     stopMotor();
   }
+}
+
+void startHorizontalMotor() {
+  noInterrupts();
+  if (level != 0) {
+    goalStepsLeft = calibrationValues.leftHorizontal[level-1];
+    goalStepsRight = calibrationValues.rightHorizontal[level-1];
+  }
+  interrupts();
 }
 
 void startMotor() {
@@ -297,6 +397,7 @@ void updateState(VITRINE_STATE newState) {
     updateState(VITRINE_STATE::LEVEL_ZERO);
   } else if (state == VITRINE_STATE::LEVEL_ZERO && actStepsCopy != goalSteps) {
     startMotor();
+    startHorizontalMotor();
     updateState(VITRINE_STATE::MOVING);
   } else if (state == VITRINE_STATE::MOVING && actStepsCopy == goalSteps) {
     if (level == 0) {
@@ -321,6 +422,7 @@ void updateState(VITRINE_STATE newState) {
     disableAllRelays();
     actLevel = 0;
     startMotor();
+    startHorizontalMotor();
     updateState(VITRINE_STATE::MOVING);
   } else if (state == VITRINE_STATE::BLOCKED && !isLaserBlocked()) {
     if (laserFreeTimestamp == 0) {
@@ -338,6 +440,15 @@ void updateState(VITRINE_STATE newState) {
   }   
 }
 
+void startCalibrationMovementVertical(long calibrationGoalSteps) {
+  noInterrupts();
+  goalSteps = calibrationGoalSteps;
+  interrupts();
+  actLevel = 0;
+  startMotor();
+  updateState(VITRINE_STATE::MOVING);
+}
+
 void computeCommand(int levelReceived, VITRINE_STATE stateReceived) {
   if (stateReceived == VITRINE_STATE::MOVING) {
     // level of command only relevant when state moving set
@@ -350,8 +461,11 @@ void computeCommand(int levelReceived, VITRINE_STATE stateReceived) {
       disableAllRelays();
       actLevel = 0;
       startMotor();
+      startHorizontalMotor();
       updateState(VITRINE_STATE::MOVING);
-    }
+    } else if (state == VITRINE_STATE::MOVING) {
+        startHorizontalMotor();
+    }    
   } else if (stateReceived == VITRINE_STATE::STOPPED) {
     // can only be stopped when moving
     if (state == VITRINE_STATE::MOVING) {
@@ -360,18 +474,147 @@ void computeCommand(int levelReceived, VITRINE_STATE stateReceived) {
     }
   } else if (stateReceived == VITRINE_STATE::DETECTING) {
     detectingQueued = true;
-  } else if (stateReceived == VITRINE_STATE::DEBUG_OFFSET) {
-    noInterrupts();
-    if (levelReceived == 0 || levelReceived == 8) {
-      debugOffsetSteps = 0;
-    } else {
-      if (levelReceived > 8) {
-        levelReceived = (levelReceived - 8) * -1;
-      }
-      debugOffsetSteps += (levelReceived * 500);
-    }
-    interrupts();
   }
+}
+
+void computeCalibrationCommand(int stepsReceived, CALIBRATION_SIDE sideReceived) {
+  if (sideReceived == CALIBRATION_SIDE::SAVE) {
+    saveEEPROMState();
+    return;
+  }
+  if (!(state == VITRINE_STATE::OPEN || state == VITRINE_STATE::BLOCKED)) {
+    // only act on calibration commands if in open/blocked state 
+    return;
+  }
+  if (level != actLevel || level <= 0) {
+    return;
+  }
+  if (sideReceived == CALIBRATION_SIDE::LEFT_HORIZONTAL_IN) {
+    stepsReceived = stepsReceived * HORIZONTAL_CALIBRATION_STEP_FACTOR;
+    calibrationValues.leftHorizontal[level-1] = calibrationValues.leftHorizontal[level-1] + stepsReceived;
+    startHorizontalMotor();
+  } else if (sideReceived == CALIBRATION_SIDE::LEFT_HORIZONTAL_OUT) {
+    stepsReceived = stepsReceived * HORIZONTAL_CALIBRATION_STEP_FACTOR;
+    calibrationValues.leftHorizontal[level-1] = calibrationValues.leftHorizontal[level-1] - stepsReceived;
+    startHorizontalMotor();
+  } else if (sideReceived == CALIBRATION_SIDE::RIGHT_HORIZONTAL_IN) {
+    stepsReceived = stepsReceived * HORIZONTAL_CALIBRATION_STEP_FACTOR;
+    calibrationValues.rightHorizontal[level-1] = calibrationValues.rightHorizontal[level-1] + stepsReceived;
+    startHorizontalMotor();
+  } else if (sideReceived == CALIBRATION_SIDE::RIGHT_HORIZONTAL_OUT) {
+    stepsReceived = stepsReceived * HORIZONTAL_CALIBRATION_STEP_FACTOR;
+    calibrationValues.rightHorizontal[level-1] = calibrationValues.rightHorizontal[level-1] - stepsReceived;
+    startHorizontalMotor();
+  } else if (sideReceived == CALIBRATION_SIDE::LEFT_VERTICAL_UP) {
+    stepsReceived = stepsReceived * VERTICAL_CALIBRATION_STEP_FACTOR;
+    calibrationValues.leftVertical[level-1] = calibrationValues.leftVertical[level-1] + stepsReceived;
+    startCalibrationMovementVertical(goalStepsFromLevelUncalibrated() + calibrationValues.leftVertical[level-1]);
+  } else if (sideReceived == CALIBRATION_SIDE::LEFT_VERTICAL_DOWN) {
+    stepsReceived = stepsReceived * VERTICAL_CALIBRATION_STEP_FACTOR;
+    calibrationValues.leftVertical[level-1] = calibrationValues.leftVertical[level-1] - stepsReceived;
+    startCalibrationMovementVertical(goalStepsFromLevelUncalibrated() + calibrationValues.leftVertical[level-1]);
+  } else if (sideReceived == CALIBRATION_SIDE::RIGHT_VERTICAL_UP) {
+    stepsReceived = stepsReceived * VERTICAL_CALIBRATION_STEP_FACTOR;
+    calibrationValues.rightVertical[level-1] = calibrationValues.rightVertical[level-1] + stepsReceived;
+    startCalibrationMovementVertical(goalStepsFromLevelUncalibrated() + calibrationValues.rightVertical[level-1]);
+  } else if (sideReceived == CALIBRATION_SIDE::RIGHT_VERTICAL_DOWN) {
+    stepsReceived = stepsReceived * VERTICAL_CALIBRATION_STEP_FACTOR;
+    calibrationValues.rightVertical[level-1] = calibrationValues.rightVertical[level-1] - stepsReceived;
+    startCalibrationMovementVertical(goalStepsFromLevelUncalibrated() + calibrationValues.rightVertical[level-1]);
+  } else if (sideReceived == CALIBRATION_SIDE::LEFT_NULLPOINT_IN) {
+    stepsReceived = stepsReceived * HORIZONTAL_CALIBRATION_STEP_FACTOR;
+    actStepsLeft = actStepsLeft - stepsReceived;
+    startHorizontalMotor();
+  } else if (sideReceived == CALIBRATION_SIDE::LEFT_NULLPOINT_OUT) {
+    stepsReceived = stepsReceived * HORIZONTAL_CALIBRATION_STEP_FACTOR;
+    actStepsLeft = actStepsLeft + stepsReceived;
+    startHorizontalMotor();
+  } else if (sideReceived == CALIBRATION_SIDE::RIGHT_NULLPOINT_IN) {
+    stepsReceived = stepsReceived * HORIZONTAL_CALIBRATION_STEP_FACTOR;
+    actStepsRight = actStepsRight - stepsReceived;
+    startHorizontalMotor();
+  } else if (sideReceived == CALIBRATION_SIDE::RIGHT_NULLPOINT_OUT) {
+    stepsReceived = stepsReceived * HORIZONTAL_CALIBRATION_STEP_FACTOR;
+    actStepsRight = actStepsRight + stepsReceived;
+    startHorizontalMotor();
+  }
+}
+
+void horizontalStepperMotorsMovement() {
+  if (micros() - lastHalfStepTimestamp > 8000) {
+    if (leftCalibrating) {
+      if (!stepStartedLeft) {
+        if (digitalRead(END_SWITCH_LEFT) == LOW) {
+          leftCalibrating = false;
+          actStepsLeft = 0;
+        } else {
+          digitalWrite(DIR_PIN_LEFT, LOW);
+          digitalWrite(STEP_PIN_LEFT, HIGH); 
+          stepStartedLeft = true;
+        }
+      } else {
+        digitalWrite(STEP_PIN_LEFT, LOW); 
+        stepStartedLeft = false;
+      }
+    } else if (actStepsLeft > goalStepsLeft) {
+      if (!stepStartedLeft) {
+        digitalWrite(DIR_PIN_LEFT, HIGH);
+        digitalWrite(STEP_PIN_LEFT, HIGH); 
+        stepStartedLeft = true;
+      } else {
+        digitalWrite(STEP_PIN_LEFT, LOW); 
+        stepStartedLeft = false;
+        actStepsLeft--;
+      }
+    } else if (actStepsLeft < goalStepsLeft) {
+      if (!stepStartedLeft) {
+        digitalWrite(DIR_PIN_LEFT, LOW);
+        digitalWrite(STEP_PIN_LEFT, HIGH); 
+        stepStartedLeft = true;
+      } else {
+        digitalWrite(STEP_PIN_LEFT, LOW); 
+        stepStartedLeft = false;
+        actStepsLeft++;
+      }
+    }
+
+    if (rightCalibrating) {
+      if (!stepStartedRight) {
+        if (digitalRead(END_SWITCH_RIGHT) == LOW) {
+          rightCalibrating = false;
+          actStepsRight = 0;
+        } else {
+          digitalWrite(DIR_PIN_RIGHT, LOW);
+          digitalWrite(STEP_PIN_RIGHT, HIGH); 
+          stepStartedRight = true;
+        }
+      } else {
+        digitalWrite(STEP_PIN_RIGHT, LOW); 
+        stepStartedRight = false;
+      }
+    } else if (actStepsRight > goalStepsRight) {
+      if (!stepStartedRight) {
+        digitalWrite(DIR_PIN_RIGHT, HIGH);
+        digitalWrite(STEP_PIN_RIGHT, HIGH); 
+        stepStartedRight = true;
+      } else {
+        digitalWrite(STEP_PIN_RIGHT, LOW); 
+        stepStartedRight = false;
+        actStepsRight--;
+      }
+    } else if (actStepsRight < goalStepsRight) {
+      if (!stepStartedRight) {
+        digitalWrite(DIR_PIN_RIGHT, LOW);
+        digitalWrite(STEP_PIN_RIGHT, HIGH); 
+        stepStartedRight = true;
+      } else {
+        digitalWrite(STEP_PIN_RIGHT, LOW); 
+        stepStartedRight = false;
+        actStepsRight++;
+      }
+    }    
+    lastHalfStepTimestamp = micros();
+  }  
 }
 
 void setup() {
@@ -410,6 +653,21 @@ void setup() {
   pinMode(LASER_BOTTOM_PIN, INPUT);
   pinMode(LASER_LEFT_PIN, INPUT);
   pinMode(LASER_RIGHT_PIN, INPUT);
+
+  pinMode(END_SWITCH_LEFT, INPUT_PULLUP);
+  pinMode(END_SWITCH_RIGHT, INPUT_PULLUP);  
+
+  pinMode(DIR_PIN_LEFT, OUTPUT);
+  pinMode(STEP_PIN_LEFT, OUTPUT);  
+  pinMode(DIR_PIN_RIGHT, OUTPUT);  
+  pinMode(STEP_PIN_RIGHT, OUTPUT);  
+  digitalWrite(DIR_PIN_LEFT, LOW);
+  digitalWrite(STEP_PIN_LEFT, LOW); 
+  digitalWrite(DIR_PIN_RIGHT, LOW);
+  digitalWrite(STEP_PIN_RIGHT, LOW);   
+
+  // load EEPROM State
+  loadEEPROMState();
   
   // init state
   level = 1;
@@ -447,20 +705,27 @@ void loop(){
     
     zcan_message zcanMsg = toZCanMessage(canMsg);   
     uint16_t nid = zcanMsg.data[0] | zcanMsg.data[1] << 8;
-    
-    if (nid == ZUBEHOER_NID && zcanMsg.data[2] == PORT && zcanMsg.command == 4) {
+
+    if (nid == ZUBEHOER_NID && zcanMsg.command == 4) {
       // print_zcanMsg(zcanMsg);  // debug print CAN
-      
-      // answere request with current state
-      if (zcanMsg.mode == ZCAN_MODE::REQUEST) {
-        sendCan(ZCAN_MODE::EVENT);
-      }
-      
-      // compute command
-      if (zcanMsg.mode == ZCAN_MODE::COMMAND) {
-        int levelReceived = levelFromByteValue(zcanMsg.data[3]);
-        VITRINE_STATE stateReceived = stateFromByteValue(zcanMsg.data[3]);
-        computeCommand(levelReceived, stateReceived);
+      if (zcanMsg.data[2] == PORT) {
+        // answere request with current state
+        if (zcanMsg.mode == ZCAN_MODE::REQUEST) {
+          sendCan(ZCAN_MODE::EVENT);
+        }
+        
+        // compute command
+        if (zcanMsg.mode == ZCAN_MODE::COMMAND) {
+          int levelReceived = levelFromByteValue(zcanMsg.data[3]);
+          VITRINE_STATE stateReceived = stateFromByteValue(zcanMsg.data[3]);
+          computeCommand(levelReceived, stateReceived);
+        } 
+      } else if (zcanMsg.data[2] == PORT_CALIBRATION) {
+        if (zcanMsg.mode == ZCAN_MODE::COMMAND) {
+          int stepsReceived = stepsFromByteValue(zcanMsg.data[3]);
+          CALIBRATION_SIDE sideReceived = sideFromByteValue(zcanMsg.data[3]);
+          computeCalibrationCommand(stepsReceived, sideReceived);
+        }
       }
     }
   }
@@ -480,4 +745,6 @@ void loop(){
     sendCan(ZCAN_MODE::EVENT);
     // printState();
   }
+
+  horizontalStepperMotorsMovement();
 }
