@@ -119,6 +119,7 @@ bool initZuebehoerState(uint16_t zubehoerNid) {
     pinMode(settings[i].relayPinSchlieser, OUTPUT);
     digitalWrite(settings[i].relayPinSchlieser, state[i].stateON ? HIGH : LOW);
   }
+  sendZubehoerCan(i, ZCAN_MODE::EVENT);
 }
 
 
@@ -145,8 +146,7 @@ void updateZuebehoerSettingsPage2(byte i, byte servoPin, byte millisPerDegree, b
     initZuebehoerState(settings[i].zubehoerNid);
   } else if (settings[i].servoPin > 0) {
     // act on Servo
-      state[i].zielWinkel = state[i].stateON ? settings[i].servoPositionA : settings[i].servoPositionB;
-    } 
+    state[i].zielWinkel = state[i].stateON ? settings[i].servoPositionA : settings[i].servoPositionB;
   }
 }
 
@@ -473,9 +473,6 @@ void loop() {
     if (state[i].actWinkel != state[i].zielWinkel && 
         millis() - state[i].lastWinkelStep >= settings[i].millisPerDegree) {
       state[i].lastWinkelStep = millis();
-      // inc act Winkel
-      int inc = ((state[i].zielWinkel - state[i].actWinkel) > 0) ? 1 : -1;
-      state[i].actWinkel = state[i].actWinkel + inc;
       // if servo was not used before attach it
       if (!servo[i].attached()) {
         if (attachedServosCount < MAX_SIMULTANEOUS_SERVOS) {
@@ -489,6 +486,9 @@ void loop() {
           continue;
         }
       }
+      // inc act Winkel
+      int inc = ((state[i].zielWinkel - state[i].actWinkel) > 0) ? 1 : -1;
+      state[i].actWinkel = state[i].actWinkel + inc;
       // move servo
       servo[i].write(state[i].actWinkel);
       // if servo arrived shut it down
@@ -498,7 +498,8 @@ void loop() {
         servo[i].detach();
         if (settings[i].relayPinSchlieser > 0) {
           digitalWrite(settings[i].relayPinSchlieser, LOW);
-        }  
+        }
+        sendZubehoerCan(i, ZCAN_MODE::EVENT);  
       }
     }
   }
